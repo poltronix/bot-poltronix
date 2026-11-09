@@ -164,6 +164,7 @@ def comandos(teste=False):
     offset = int(OFFSET.read_text()) if OFFSET.exists() else 0
     ups = tg("getUpdates", offset=offset, timeout=0,
              allowed_updates=["message", "channel_post", "callback_query"])
+    print(f"Bot @{tg('getMe')['username']}: {len(ups)} mensagem(ns) nova(s) | rascunho = {rascunho_id()}")
     for u in ups:
         OFFSET.write_text(str(u["update_id"] + 1))
         try:
