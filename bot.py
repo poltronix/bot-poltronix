@@ -1,30 +1,34 @@
 """
-Bot de postagens automáticas de filmes (rascunho).
+Bot de postagens de filmes no canal @poltronix, com aprovação num canal de rascunhos.
 
 Fluxo:
  1. Busca o filme no TMDB (capa, título, ano e sinopse em pt-BR).
- 2. Posta a capa com "Título (Ano)" + sinopse no canal @poltronix.
- 3. Cada post leva um botão "🎬 ASSISTA AQUI" para https://t.me/canalpoltronix
-    (os trailers lá continuam manuais).
+ 2. Manda uma PRÉVIA para o canal de rascunhos, com os botões ✅ Aprovar / ❌ Descartar.
+ 3. Quando você aprova, posta no @poltronix: capa + "Título (Ano)" + sinopse,
+    com o botão "🎬 ASSISTA AQUI" levando para https://t.me/canalpoltronix.
 
-Uso:
-  python bot.py "Duna Parte Dois"      # posta um filme pelo nome
-  python bot.py "Duna (2021)"          # nome + ano, para acertar o filme certo
-  python bot.py --id 693134            # posta pelo ID do TMDB
-  python bot.py --populares 3          # posta 3 filmes em cartaz no Brasil ainda não postados
-  python bot.py --comandos             # lê os pedidos que você mandou no privado do bot e posta
-  python bot.py "Duna" --teste         # só mostra o que seria postado, não envia nada
+De onde vêm os filmes:
+ - Automático: lançamentos em cartaz no Brasil (--populares N), sem repetir.
+ - Você: manda o nome do filme no canal de rascunhos (ou no privado do bot).
 
-Comandos no privado do bot (só o ADMIN_USERNAME é atendido):
-  /postar Nome do Filme      (ou só o nome do filme)
-  /postar Nome do Filme (2021)
-  /forcar Nome do Filme      (posta mesmo se já foi postado antes)
+Comandos (no canal de rascunhos ou no privado do bot):
+  Nome do Filme              -> manda prévia para aprovar
+  Nome do Filme (2021)       -> idem, escolhendo o ano
+  /forcar Nome do Filme      -> manda prévia mesmo se já foi postado antes
+  /rascunho                  -> (enviar dentro do canal novo) define este canal como o de rascunhos
+
+Uso local:
+  python bot.py "Duna"             # manda prévia (ou posta direto se não houver canal de rascunhos)
+  python bot.py --populares 1      # sugere 1 lançamento
+  python bot.py --comandos         # processa pedidos e aprovações pendentes
+  python bot.py "Duna" --teste     # só mostra o que seria enviado
 
 Variáveis de ambiente (arquivo .env ou Secrets do GitHub):
   TELEGRAM_TOKEN   token do @BotFather
-  TMDB_TOKEN       "API Read Access Token" do themoviedb.org (grátis)
-  ADMIN_USERNAME   seu @ do Telegram (sem o @), o único que pode pedir posts
+  TMDB_TOKEN       "API Read Access Token" do themoviedb.org
+  ADMIN_USERNAME   seu @ do Telegram (sem o @)
   CANAL_ID         padrão: @poltronix
+  RASCUNHO_ID      opcional; se vazio, usa o canal registrado com /rascunho (rascunho.txt)
 """
 import argparse, json, os, re, sys, pathlib
 import requests
@@ -46,17 +50,45 @@ CANAL = os.environ.get("CANAL_ID", "@poltronix")
 BOTAO_TEXTO = os.environ.get("BOTAO_TEXTO", "🎬 ASSISTA AQUI")
 BOTAO_LINK = os.environ.get("BOTAO_LINK", "https://t.me/canalpoltronix")
 ADMIN = os.environ.get("ADMIN_USERNAME", "").lstrip("@").lower()
-HIST = pathlib.Path("postados.json")
-OFFSET = pathlib.Path("offset.txt")
+HIST = pathlib.Path("postados.json")       # filmes já publicados ou descartados
+OFFSET = pathlib.Path("offset.txt")        # última atualização lida do Telegram
+RASC_FILE = pathlib.Path("rascunho.txt")   # id do canal de rascunhos (definido com /rascunho)
+
+# ---------------- utilidades ----------------
 
 def historico():
     return json.loads(HIST.read_text()) if HIST.exists() else []
+
+def marcar(mid):
+    hist = historico()
+    if mid not in hist:
+        hist.append(mid); HIST.write_text(json.dumps(hist))
+
+def rascunho_id():
+    rid = os.environ.get("RASCUNHO_ID", "").strip()
+    if not rid and RASC_FILE.exists():
+        rid = RASC_FILE.read_text().strip()
+    return int(rid) if re.fullmatch(r"-?\d+", rid or "") else (rid or None)
 
 def tmdb(path, **params):
     params.setdefault("language", "pt-BR")
     r = requests.get(f"{TMDB}{path}", headers=HDR, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
+
+def tg(method, **data):
+    r = requests.post(f"{TG}/{method}", json=data, timeout=30).json()
+    if not r.get("ok"):
+        raise RuntimeError(f"Telegram {method}: {r.get('description', r)}")
+    return r["result"]
+
+def tg_quieto(method, **data):
+    try:
+        return tg(method, **data)
+    except Exception as e:
+        print(f"(aviso) {e}")
+
+# ---------------- filmes ----------------
 
 def buscar(nome):
     """Aceita 'Nome' ou 'Nome (2021)'. Retorna o ID do TMDB ou None."""
@@ -80,65 +112,143 @@ def legenda(f):
     sinopse = f["sinopse"] if len(f["sinopse"]) < 900 else f["sinopse"][:897] + "..."
     return f"<b>{f['titulo']} ({f['ano']})</b>\n\n{sinopse}"
 
-def tg(method, **data):
-    r = requests.post(f"{TG}/{method}", json=data, timeout=30).json()
-    if not r.get("ok"):
-        raise RuntimeError(f"Telegram {method}: {r}")
-    return r["result"]
-
-def postar(f, teste=False):
-    txt = legenda(f)
-    if teste:
-        print("---- CANAL ----\n" + txt + f"\n[capa] {f['capa']}\n[botão] {BOTAO_TEXTO} -> {BOTAO_LINK}")
-        return
-    kb = {"inline_keyboard": [[{"text": BOTAO_TEXTO, "url": BOTAO_LINK}]]}
+def enviar(chat, f, botoes):
+    kb = {"inline_keyboard": botoes}
     if f["capa"]:
-        tg("sendPhoto", chat_id=CANAL, photo=f["capa"], caption=txt, parse_mode="HTML", reply_markup=kb)
-    else:
-        tg("sendMessage", chat_id=CANAL, text=txt, parse_mode="HTML", reply_markup=kb)
-    hist = historico()
-    if f["id"] not in hist:
-        hist.append(f["id"]); HIST.write_text(json.dumps(hist))
-    print(f"Postado: {f['titulo']}")
+        return tg("sendPhoto", chat_id=chat, photo=f["capa"], caption=legenda(f),
+                  parse_mode="HTML", reply_markup=kb)
+    return tg("sendMessage", chat_id=chat, text=legenda(f), parse_mode="HTML", reply_markup=kb)
+
+BOTAO_CANAL = [[{"text": BOTAO_TEXTO, "url": BOTAO_LINK}]]
+
+def publicar(f):
+    enviar(CANAL, f, BOTAO_CANAL)
+    marcar(f["id"])
+    print(f"Publicado: {f['titulo']}")
+
+def previa(f, teste=False):
+    """Manda para o canal de rascunhos; sem canal de rascunhos, publica direto."""
+    rid = rascunho_id()
+    if teste:
+        print(f"---- {'RASCUNHO' if rid else 'CANAL'} ----\n{legenda(f)}\n[capa] {f['capa']}")
+        return
+    if not rid:
+        return publicar(f)
+    botoes = BOTAO_CANAL + [[
+        {"text": "✅ Aprovar", "callback_data": f"ok:{f['id']}"},
+        {"text": "❌ Descartar", "callback_data": f"no:{f['id']}"},
+    ]]
+    enviar(rid, f, botoes)
+    print(f"Prévia enviada: {f['titulo']}")
+
+def pedido(nome, forcar=False, teste=False):
+    """Trata um nome de filme pedido por você. Retorna a resposta em texto."""
+    mid = buscar(nome)
+    if not mid:
+        return f"❌ Não achei '{nome}' no TMDB. Tente com o ano: {nome} (2024)"
+    if mid in historico() and not forcar:
+        return f"⚠️ '{nome}' já foi postado (ou descartado) antes. Mande /forcar {nome} para ver de novo."
+    f = detalhes(mid)
+    previa(f, teste)
+    return None
+
+# ---------------- leitura do Telegram ----------------
+
+def responder(chat, texto, teste=False):
+    print(texto)
+    if not teste:
+        tg_quieto("sendMessage", chat_id=chat, text=texto)
 
 def comandos(teste=False):
-    """Processa mensagens que o admin mandou no privado do bot."""
-    if not ADMIN:
-        sys.exit("Defina ADMIN_USERNAME para usar --comandos")
+    """Processa pedidos de filmes e cliques em Aprovar/Descartar."""
     offset = int(OFFSET.read_text()) if OFFSET.exists() else 0
-    ups = tg("getUpdates", offset=offset, timeout=0, allowed_updates=["message"])
+    ups = tg("getUpdates", offset=offset, timeout=0,
+             allowed_updates=["message", "channel_post", "callback_query"])
     for u in ups:
         OFFSET.write_text(str(u["update_id"] + 1))
-        msg = u.get("message") or {}
-        chat = msg.get("chat", {})
-        texto = (msg.get("text") or "").strip()
-        user = (msg.get("from", {}).get("username") or "").lower()
-        if chat.get("type") != "private" or not texto:
-            continue
-        if user != ADMIN:
-            tg("sendMessage", chat_id=chat["id"], text="Desculpe, só o administrador pode usar este bot.")
-            continue
-        forcar = texto.lower().startswith("/forcar")
-        nome = re.sub(r"^/(postar|forcar)(@\w+)?\s*", "", texto, flags=re.I).strip()
-        if not nome or nome.startswith("/"):
-            tg("sendMessage", chat_id=chat["id"],
-               text="Mande /postar Nome do Filme (ou Nome do Filme (2021) para escolher o ano).")
-            continue
         try:
-            mid = buscar(nome)
-            if not mid:
-                resp = f"❌ Não achei '{nome}' no TMDB. Tente com o ano: {nome} (2024)"
-            elif mid in historico() and not forcar:
-                resp = f"⚠️ '{nome}' já foi postado antes. Use /forcar {nome} para postar de novo."
+            if "callback_query" in u:
+                clique(u["callback_query"], teste)
             else:
-                f = detalhes(mid)
-                postar(f, teste)
-                resp = f"✅ Postado no {CANAL}: {f['titulo']} ({f['ano']})"
+                mensagem(u.get("message") or u.get("channel_post") or {}, teste)
         except Exception as e:
-            resp = f"❌ Erro ao postar '{nome}': {e}"
-        print(resp)
-        if not teste:
-            tg("sendMessage", chat_id=chat["id"], text=resp)
+            print(f"Erro ao processar atualização {u['update_id']}: {e}")
+
+def mensagem(msg, teste):
+    chat = msg.get("chat", {})
+    texto = (msg.get("text") or "").strip()
+    if not texto:
+        return
+    user = (msg.get("from", {}).get("username") or "").lower()
+    rid = rascunho_id()
+
+    # Registrar o canal/grupo de rascunhos: mande /rascunho dentro dele
+    if re.match(r"^/rascunho(@\w+)?$", texto, re.I):
+        # em canal não há remetente; em grupo, só o admin pode registrar
+        if chat.get("type") == "channel" or user == ADMIN:
+            RASC_FILE.write_text(str(chat["id"]))
+            responder(chat["id"], "✅ Este chat agora é o canal de rascunhos. "
+                      "Mande nomes de filmes aqui e aprove as prévias.", teste)
+        return
+
+    no_rascunho = rid is not None and str(chat.get("id")) == str(rid)
+    privado_admin = chat.get("type") == "private" and user == ADMIN
+    if not (no_rascunho or privado_admin):
+        if chat.get("type") == "private":
+            responder(chat["id"], "Desculpe, só o administrador pode usar este bot.", teste)
+        return  # ignora o @poltronix e outros chats
+    if no_rascunho and chat.get("type") != "channel" and user != ADMIN:
+        return  # num grupo de rascunhos, só o admin pede filmes
+
+    forcar = texto.lower().startswith("/forcar")
+    nome = re.sub(r"^/(postar|forcar)(@\w+)?\s*", "", texto, flags=re.I).strip()
+    if not nome or nome.startswith("/"):
+        responder(chat["id"], "Mande o nome do filme, por exemplo: Duna (2021)", teste)
+        return
+    try:
+        resp = pedido(nome, forcar, teste)
+    except Exception as e:
+        resp = f"❌ Erro com '{nome}': {e}"
+    if resp:
+        responder(chat["id"], resp, teste)
+
+_ja_tratados = set()
+
+def clique(cq, teste):
+    data = cq.get("data", "")
+    msg = cq.get("message") or {}
+    chat = msg.get("chat", {})
+    user = (cq.get("from", {}).get("username") or "").lower()
+    rid = rascunho_id()
+    if rid is None or str(chat.get("id")) != str(rid) or user != ADMIN:
+        tg_quieto("answerCallbackQuery", callback_query_id=cq["id"], text="Sem permissão.")
+        return
+    acao, _, mid = data.partition(":")
+    chave = (chat.get("id"), msg.get("message_id"))
+    if not mid.isdigit() or chave in _ja_tratados:
+        return
+    _ja_tratados.add(chave)
+    f = detalhes(int(mid))
+    if acao == "ok":
+        if teste:
+            print(f"[teste] publicaria {f['titulo']}"); return
+        publicar(f)
+        status = f"✅ PUBLICADO no {CANAL}"
+    else:
+        marcar(f["id"])
+        status = "❌ DESCARTADO"
+    tg_quieto("answerCallbackQuery", callback_query_id=cq["id"], text=status)
+    # Atualiza a prévia: troca os botões pelo status
+    novo = f"{status}\n\n{legenda(f)}"
+    kb = {"inline_keyboard": []}
+    if msg.get("photo"):
+        tg_quieto("editMessageCaption", chat_id=chat["id"], message_id=msg["message_id"],
+                  caption=novo, parse_mode="HTML", reply_markup=kb)
+    else:
+        tg_quieto("editMessageText", chat_id=chat["id"], message_id=msg["message_id"],
+                  text=novo, parse_mode="HTML", reply_markup=kb)
+
+# ---------------- principal ----------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -154,14 +264,17 @@ def main():
         hist = set(historico())
         ids = [m["id"] for m in tmdb("/movie/now_playing", region="BR")["results"] if m["id"] not in hist]
         for mid in ids[:a.populares]:
-            postar(detalhes(mid), a.teste)
+            previa(detalhes(mid), a.teste)
+            if rascunho_id():
+                marcar(mid)  # não sugerir o mesmo lançamento de novo
+    elif a.id:
+        previa(detalhes(a.id), a.teste)
+    elif a.nome:
+        resp = pedido(a.nome, forcar=True, teste=a.teste)
+        if resp:
+            sys.exit(resp)
     else:
-        if not (a.id or a.nome):
-            ap.error("informe um nome, --id, --populares ou --comandos")
-        mid = a.id or buscar(a.nome)
-        if not mid:
-            sys.exit(f"Nenhum filme encontrado para '{a.nome}'")
-        postar(detalhes(mid), a.teste)
+        ap.error("informe um nome, --id, --populares ou --comandos")
 
 if __name__ == "__main__":
     main()

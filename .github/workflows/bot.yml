@@ -2,14 +2,14 @@ name: Bot Poltronix
 
 on:
   schedule:
-    # Pedidos enviados no privado do bot: confere a cada 10 minutos
-    - cron: "*/10 * * * *"
-    # Postagens automáticas dos lançamentos (horário UTC; 15h, 21h e 01h UTC = 12h, 18h e 22h de Brasília)
+    # Pedidos e aprovações no Telegram: confere a cada 5 minutos
+    - cron: "*/5 * * * *"
+    # Sugestões automáticas de lançamentos (chegam no rascunho para aprovar) (horário UTC; 15h, 21h e 01h UTC = 12h, 18h e 22h de Brasília)
     - cron: "0 15,21,1 * * *"
   workflow_dispatch:
     inputs:
       filme:
-        description: "Nome do filme para postar agora (opcional)"
+        description: "Nome do filme para mandar prévia agora (opcional)"
         required: false
 
 concurrency:
@@ -33,20 +33,20 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
 
-      - name: Postar filme pedido manualmente no GitHub
+      - name: Prévia de filme pedido pelo GitHub
         if: github.event_name == 'workflow_dispatch' && inputs.filme != ''
         run: python bot.py "${{ inputs.filme }}"
 
-      - name: Postagem automática de lançamentos
+      - name: Sugestão automática de lançamentos (vai para o rascunho)
         if: github.event.schedule == '0 15,21,1 * * *'
         run: python bot.py --populares 1
 
-      - name: Pedidos enviados no privado do bot
+      - name: Pedidos de filmes e aprovações
         run: python bot.py --comandos
 
       - name: Salvar histórico
         run: |
           git config user.name "bot-poltronix"
           git config user.email "bot-poltronix@users.noreply.github.com"
-          git add postados.json offset.txt 2>/dev/null || true
+          git add postados.json offset.txt rascunho.txt 2>/dev/null || true
           git diff --cached --quiet || (git commit -m "Atualiza histórico de posts" && git push)
