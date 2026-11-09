@@ -245,12 +245,14 @@ def previa(f, teste=False):
         print(f"[capa] {fonte}")
         return
     if not rid:
-        return publicar(f)
+        sys.exit("Canal de rascunhos não definido: mande /rascunho no canal de rascunhos. Nada foi publicado.")
     botoes = BOTAO_CANAL + [[
         {"text": "✅ Aprovar", "callback_data": f"ok:{f['id']}"},
         {"text": "❌ Descartar", "callback_data": f"no:{f['id']}"},
     ]]
-    enviar(rid, f, botoes)
+    m = enviar(rid, f, botoes)
+    tg_quieto("sendMessage", chat_id=rid, reply_to_message_id=m["message_id"],
+              text=f"📷 Capa: {f.get('fonte_capa') or 'nenhuma encontrada'} (versão do bot: 3)")
     print(f"Prévia enviada: {f['titulo']}")
 
 def pedido(nome, forcar=False, teste=False):
