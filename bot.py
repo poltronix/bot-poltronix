@@ -72,6 +72,7 @@ def rascunho_id():
 
 def tmdb(path, **params):
     params.setdefault("language", "pt-BR")
+    params = {k: v for k, v in params.items() if v is not None}
     r = requests.get(f"{TMDB}{path}", headers=HDR, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
@@ -104,8 +105,28 @@ def detalhes(mid):
         "titulo": f["title"],
         "ano": (f.get("release_date") or "")[:4],
         "sinopse": f.get("overview") or "Sinopse indisponível.",
-        "capa": f.get("poster_path"),  # baixada em resolução original na hora de enviar
+        "capa": melhor_capa(mid) or f.get("poster_path"),
     }
+
+def melhor_capa(mid):
+    """Escolhe, entre TODAS as capas do filme no TMDB, a mais nítida.
+    Prioridade: capa em português em alta resolução > em inglês > sem texto,
+    sempre preferindo a maior resolução (mínimo 1400px de largura)."""
+    try:
+        imgs = tmdb(f"/movie/{mid}/images", language=None,
+                    include_image_language="pt,en,null").get("posters", [])
+    except Exception as e:
+        print(f"(aviso) imagens: {e}")
+        return None
+    if not imgs:
+        return None
+    def nota(i):
+        return (i.get("vote_average", 0) or 0) * min(i.get("vote_count", 0) or 0, 10)
+    for lang in ("pt", "en", None):
+        hd = [i for i in imgs if i.get("iso_639_1") == lang and i.get("width", 0) >= 1400]
+        if hd:
+            return max(hd, key=lambda i: (nota(i), i["width"]))["file_path"]
+    return max(imgs, key=lambda i: i.get("width", 0))["file_path"]
 
 def legenda(f):
     # Formato igual aos posts do canal: título (ano) em negrito + sinopse
