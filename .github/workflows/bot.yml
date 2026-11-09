@@ -45,12 +45,14 @@ jobs:
         run: python bot.py --comandos
 
       - name: Salvar histórico
+        if: always()
         run: |
+          ls -la
           git config user.name "bot-poltronix"
           git config user.email "bot-poltronix@users.noreply.github.com"
-          for f in postados.json offset.txt rascunho.txt; do [ -f "$f" ] && git add "$f"; done
-          if ! git diff --cached --quiet; then
-            git commit -m "Atualiza histórico de posts"
-            git pull --rebase -X theirs origin main || true
-            git push
-          fi
+          git add -A -- $(ls postados.json offset.txt rascunho.txt 2>/dev/null)
+          git status --short
+          if git diff --cached --quiet; then echo "Nada novo para salvar"; exit 0; fi
+          git commit -m "Atualiza histórico de posts"
+          git pull --rebase -X theirs origin main
+          git push

@@ -125,8 +125,13 @@ def melhor_capa(mid):
     for lang in ("pt", "en", None):
         hd = [i for i in imgs if i.get("iso_639_1") == lang and i.get("width", 0) >= 1400]
         if hd:
-            return max(hd, key=lambda i: (nota(i), i["width"]))["file_path"]
-    return max(imgs, key=lambda i: i.get("width", 0))["file_path"]
+            esc = max(hd, key=lambda i: (nota(i), i["width"]))
+            break
+    else:
+        esc = max(imgs, key=lambda i: i.get("width", 0))
+    print(f"Capa escolhida entre {len(imgs)}: {esc['width']}x{esc['height']} "
+          f"({esc.get('iso_639_1')}) https://image.tmdb.org/t/p/original{esc['file_path']}")
+    return esc["file_path"]
 
 def legenda(f):
     # Formato igual aos posts do canal: título (ano) em negrito + sinopse
@@ -140,6 +145,7 @@ def baixar_capa(poster_path):
         r = requests.get(f"https://image.tmdb.org/t/p/{tam}{poster_path}", timeout=60)
         r.raise_for_status()
         if len(r.content) < 9_500_000:
+            print(f"Capa baixada ({tam}): {len(r.content)//1024} KB")
             return r.content
     return r.content
 
