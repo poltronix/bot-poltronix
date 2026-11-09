@@ -111,13 +111,19 @@ def detalhes(mid):
     }
 
 # ---------------- capas em alta qualidade ----------------
-# Fontes, em ordem de preferência (todas sem marca d'água):
-#  1. Apple TV / iTunes Brasil  -> arte oficial em português, em altíssima resolução
-#  2. TMDB, capa em português   -> a de maior resolução / mais votada
-#  3. Apple TV / iTunes EUA     -> arte oficial em inglês
-#  4. TMDB, capa em inglês ou sem texto
-# A primeira com pelo menos MIN_LARGURA px de largura vence; se nenhuma, a maior.
-MIN_LARGURA = 1400
+# O bot junta capas de várias fontes (todas sem marca d'água) e ordena:
+#  1º  capas em PORTUGUÊS, da mais nítida para a menos nítida:
+#      Apple TV/iTunes Brasil, TMDB (pt-BR antes de pt-PT), fanart.tv (pt),
+#      Google Imagens (se GOOGLE_KEY/GOOGLE_CX estiverem configurados)
+#  2º  só se não houver nenhuma em português: sem texto, depois em inglês.
+# Na prévia, o botão "🔄 Outra capa" passa para a próxima da lista.
+MIN_LARGURA = 1000          # abaixo disso a capa é considerada "fraca"
+FANART_KEY = os.environ.get("FANART_KEY", "")
+GOOGLE_KEY = os.environ.get("GOOGLE_KEY", "")
+GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
+SITES_RUINS = ("pinterest", "alamy", "shutterstock", "dreamstime", "123rf", "depositphotos",
+               "istockphoto", "gettyimages", "ebay", "mercadolivre", "amazon", "aliexpress",
+               "redbubble", "etsy", "youtube", "facebook", "instagram", "tiktok")
 
 def _norm(t):
     return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", t or "").encode("ascii", "ignore").decode().lower())
@@ -144,17 +150,71 @@ def capas_tmdb(mid):
                     include_image_language="pt,en,null").get("posters", [])
     except Exception as e:
         print(f"(aviso) imagens TMDB: {e}")
-        return {}
-    def nota(i):
-        return (i.get("vote_average", 0) or 0) * min(i.get("vote_count", 0) or 0, 10)
-    melhor = {}
-    for lang in ("pt", "en", None):
-        cands = [i for i in imgs if i.get("iso_639_1") == lang]
-        if cands:
-            hd = [i for i in cands if i.get("width", 0) >= MIN_LARGURA] or cands
-            esc = max(hd, key=lambda i: (nota(i), i.get("width", 0)))
-            melhor[lang] = f"https://image.tmdb.org/t/p/original{esc['file_path']}"
-    return melhor
+        return []
+    out = []
+    for i in imgs:
+        lang = i.get("iso_639_1")
+        br = i.get("iso_3166_1") == "BR"
+        out.append({"lang": lang or "x", "w": i.get("width", 0), "fonte": "TMDB" + (" BR" if br else ""),
+                    "prio": 1 if br else 2, "nota": i.get("vote_average", 0) or 0,
+                    "url": f"https://image.tmdb.org/t/p/original{i['file_path']}"})
+    return out
+
+def capas_fanart(mid):
+    if not FANART_KEY:
+        return []
+    try:
+        r = requests.get(f"https://webservice.fanart.tv/v3/movies/{mid}",
+                         params={"api_key": FANART_KEY}, timeout=20).json()
+    except Exception as e:
+        print(f"(aviso) fanart.tv: {e}")
+        return []
+    return [{"lang": (p.get("lang") or "x").replace("00", "x"), "w": 1000, "fonte": "fanart.tv",
+             "prio": 3, "nota": int(p.get("likes") or 0), "url": p["url"]}
+            for p in r.get("movieposter", [])]
+
+def capas_google(f):
+    if not (GOOGLE_KEY and GOOGLE_CX):
+        return []
+    try:
+        r = requests.get("https://www.googleapis.com/customsearch/v1", timeout=20, params={
+            "key": GOOGLE_KEY, "cx": GOOGLE_CX, "searchType": "image", "imgSize": "xxlarge",
+            "q": f"{f['titulo']} {f['ano']} pôster oficial filme", "gl": "br", "lr": "lang_pt",
+            "num": 10, "safe": "active"}).json()
+    except Exception as e:
+        print(f"(aviso) Google: {e}")
+        return []
+    out = []
+    for it in r.get("items", []):
+        im = it.get("image", {})
+        w, h = im.get("width", 0), im.get("height", 1)
+        site = (it.get("displayLink") or "").lower()
+        if w >= MIN_LARGURA and 0.6 <= w / h <= 0.75 and not any(x in site for x in SITES_RUINS):
+            out.append({"lang": "pt", "w": w, "fonte": f"Google ({site})", "prio": 4, "nota": 0,
+                        "url": it["link"]})
+    return out[:3]
+
+def capas_candidatas(f):
+    """Lista ordenada de capas: português primeiro, das mais nítidas para as menos."""
+    titulos = [t for t in dict.fromkeys([f["titulo"], f.get("original")]) if t]
+    c = []
+    br = capa_itunes(titulos, f["ano"], "br")
+    if br:
+        c.append({"lang": "pt", "w": 2000, "fonte": "Apple TV BR", "prio": 0, "nota": 0, "url": br})
+    c += capas_tmdb(f["id"]) + capas_fanart(f["id"]) + capas_google(f)
+    us = capa_itunes(titulos[::-1], f["ano"], "us")
+    if us:
+        c.append({"lang": "en", "w": 2000, "fonte": "Apple TV EUA", "prio": 0, "nota": 0, "url": us})
+    if not c and f.get("poster_padrao"):
+        c.append({"lang": "?", "w": 0, "fonte": "TMDB", "prio": 9, "nota": 0,
+                  "url": f"https://image.tmdb.org/t/p/original{f['poster_padrao']}"})
+    grupo = {"pt": 0, "x": 1, "en": 2}
+    c.sort(key=lambda i: (grupo.get(i["lang"], 3), i["w"] < MIN_LARGURA, i["prio"], -i["nota"], -i["w"]))
+    vistos, unicas = set(), []
+    for i in c:
+        if i["url"] not in vistos:
+            vistos.add(i["url"]); unicas.append(i)
+    return unicas
 
 def tamanho(conteudo):
     try:
@@ -162,40 +222,26 @@ def tamanho(conteudo):
     except Exception:
         return (0, 0)
 
-def melhor_capa(f):
-    """Testa as fontes em ordem e devolve (bytes_jpeg, descricao) da capa mais nítida."""
-    titulos = [t for t in dict.fromkeys([f["titulo"], f.get("original")]) if t]
-    tm = capas_tmdb(f["id"])
-    fontes = [
-        ("Apple TV BR", lambda: capa_itunes(titulos, f["ano"], "br")),
-        ("TMDB pt", lambda: tm.get("pt")),
-        ("Apple TV EUA", lambda: capa_itunes(titulos[::-1], f["ano"], "us")),
-        ("TMDB en", lambda: tm.get("en")),
-        ("TMDB sem texto", lambda: tm.get(None)),
-        ("TMDB padrão", lambda: f["poster_padrao"] and f"https://image.tmdb.org/t/p/original{f['poster_padrao']}"),
-    ]
-    achadas = []
-    for nome, pegar in fontes:
-        url = pegar()
-        if not url:
-            continue
+def melhor_capa(f, inicio=0):
+    """Baixa a capa número `inicio` da lista (pulando as que falharem).
+    Retorna (bytes_jpeg, descricao, indice_usado, total)."""
+    cands = capas_candidatas(f)
+    for n in range(inicio, len(cands)):
+        c = cands[n]
         try:
-            r = requests.get(url, timeout=60)
+            r = requests.get(c["url"], timeout=60, headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
+            w, h = tamanho(r.content)
         except Exception as e:
-            print(f"(aviso) {nome}: {e}")
+            print(f"(aviso) {c['fonte']}: {e}")
             continue
-        w, h = tamanho(r.content)
-        print(f"  {nome}: {w}x{h} {url}")
         if w == 0:
             continue
-        achadas.append((w, nome, r.content))
-        if w >= MIN_LARGURA:
-            break
-    if not achadas:
-        return None, None
-    w, nome, conteudo = next((a for a in achadas if a[0] >= MIN_LARGURA), max(achadas, key=lambda a: a[0]))
-    return preparar(conteudo), f"{nome} {w}px"
+        idioma = {"pt": "português", "en": "inglês", "x": "sem texto"}.get(c["lang"], c["lang"])
+        desc = f"{c['fonte']} · {idioma} · {w}x{h}"
+        print(f"Capa {n+1}/{len(cands)}: {desc} {c['url']}")
+        return preparar(r.content), desc, n, len(cands)
+    return None, None, inicio, len(cands)
 
 def preparar(conteudo):
     """Ajusta para o máximo que o Telegram exibe (2560px) em JPEG de alta qualidade."""
@@ -210,24 +256,31 @@ def legenda(f):
     sinopse = f["sinopse"] if len(f["sinopse"]) < 900 else f["sinopse"][:897] + "..."
     return f"<b>{f['titulo']} ({f['ano']})</b>\n\n{sinopse}"
 
-def enviar(chat, f, botoes):
+def enviar(chat, f, botoes, cabecalho=""):
     kb = {"inline_keyboard": botoes}
-    if f.get("file_id"):  # mesma imagem da prévia aprovada, sem recompressão extra
-        return tg("sendPhoto", chat_id=chat, photo=f["file_id"], caption=legenda(f),
+    texto = cabecalho + legenda(f)
+    if f.get("file_id"):  # mesma imagem da prévia aprovada
+        return tg("sendPhoto", chat_id=chat, photo=f["file_id"], caption=texto,
                   parse_mode="HTML", reply_markup=kb)
-    if "foto" not in f:
-        f["foto"], f["fonte_capa"] = melhor_capa(f)
-        print(f"Capa escolhida: {f['fonte_capa']}")
-    if f["foto"]:
-        foto = f["foto"]
+    if f.get("foto"):
         r = requests.post(f"{TG}/sendPhoto", timeout=120,
-                          data={"chat_id": chat, "caption": legenda(f), "parse_mode": "HTML",
+                          data={"chat_id": chat, "caption": texto, "parse_mode": "HTML",
                                 "reply_markup": json.dumps(kb)},
-                          files={"photo": ("capa.jpg", foto, "image/jpeg")}).json()
+                          files={"photo": ("capa.jpg", f["foto"], "image/jpeg")}).json()
         if not r.get("ok"):
             raise RuntimeError(f"Telegram sendPhoto: {r.get('description', r)}")
         return r["result"]
-    return tg("sendMessage", chat_id=chat, text=legenda(f), parse_mode="HTML", reply_markup=kb)
+    return tg("sendMessage", chat_id=chat, text=texto, parse_mode="HTML", reply_markup=kb)
+
+def botoes_previa(mid, n):
+    return BOTAO_CANAL + [
+        [{"text": "✅ Aprovar", "callback_data": f"ok:{mid}"},
+         {"text": "❌ Descartar", "callback_data": f"no:{mid}"}],
+        [{"text": "🔄 Outra capa", "callback_data": f"cv:{mid}:{n + 1}"}],
+    ]
+
+def cabecalho_previa(desc, n, total):
+    return f"📷 Capa {n + 1}/{total}: {desc or 'nenhuma encontrada'}\n\n" if total else "📷 Sem capa\n\n"
 
 BOTAO_CANAL = [[{"text": BOTAO_TEXTO, "url": BOTAO_LINK}]]
 
@@ -237,22 +290,15 @@ def publicar(f):
     print(f"Publicado: {f['titulo']}")
 
 def previa(f, teste=False):
-    """Manda para o canal de rascunhos; sem canal de rascunhos, publica direto."""
+    """Manda a prévia para o canal de rascunhos (nunca publica direto)."""
     rid = rascunho_id()
+    f["foto"], desc, n, total = melhor_capa(f)
     if teste:
-        print(f"---- {'RASCUNHO' if rid else 'CANAL'} ----\n{legenda(f)}")
-        foto, fonte = melhor_capa(f)
-        print(f"[capa] {fonte}")
+        print(f"---- RASCUNHO ----\n{cabecalho_previa(desc, n, total)}{legenda(f)}")
         return
     if not rid:
         sys.exit("Canal de rascunhos não definido: mande /rascunho no canal de rascunhos. Nada foi publicado.")
-    botoes = BOTAO_CANAL + [[
-        {"text": "✅ Aprovar", "callback_data": f"ok:{f['id']}"},
-        {"text": "❌ Descartar", "callback_data": f"no:{f['id']}"},
-    ]]
-    m = enviar(rid, f, botoes)
-    tg_quieto("sendMessage", chat_id=rid, reply_to_message_id=m["message_id"],
-              text=f"📷 Capa: {f.get('fonte_capa') or 'nenhuma encontrada'} (versão do bot: 3)")
+    enviar(rid, f, botoes_previa(f["id"], n), cabecalho_previa(desc, n, total))
     print(f"Prévia enviada: {f['titulo']}")
 
 def pedido(nome, forcar=False, teste=False):
@@ -338,12 +384,29 @@ def clique(cq, teste):
     if rid is None or str(chat.get("id")) != str(rid) or user != ADMIN:
         tg_quieto("answerCallbackQuery", callback_query_id=cq["id"], text="Sem permissão.")
         return
-    acao, _, mid = data.partition(":")
+    partes = data.split(":")
+    acao, mid = partes[0], partes[1] if len(partes) > 1 else ""
     chave = (chat.get("id"), msg.get("message_id"))
     if not mid.isdigit() or chave in _ja_tratados:
         return
     _ja_tratados.add(chave)
     f = detalhes(int(mid))
+    if acao == "cv":  # trocar a capa da prévia pela próxima da lista
+        inicio = int(partes[2]) if len(partes) > 2 and partes[2].isdigit() else 0
+        foto, desc, n, total = melhor_capa(f, inicio)
+        if not foto:  # acabou a lista: volta para a primeira
+            foto, desc, n, total = melhor_capa(f, 0)
+        if teste or not foto:
+            print(f"[teste] trocaria capa para {desc}"); return
+        media = {"type": "photo", "media": "attach://foto", "parse_mode": "HTML",
+                 "caption": cabecalho_previa(desc, n, total) + legenda(f)}
+        r = requests.post(f"{TG}/editMessageMedia", timeout=120, data={
+            "chat_id": chat["id"], "message_id": msg["message_id"], "media": json.dumps(media),
+            "reply_markup": json.dumps({"inline_keyboard": botoes_previa(f["id"], n)})},
+            files={"foto": ("capa.jpg", foto, "image/jpeg")}).json()
+        print("Capa trocada" if r.get("ok") else f"(aviso) trocar capa: {r}")
+        tg_quieto("answerCallbackQuery", callback_query_id=cq["id"], text="Capa trocada")
+        return
     if acao == "ok":
         if teste:
             print(f"[teste] publicaria {f['titulo']}"); return

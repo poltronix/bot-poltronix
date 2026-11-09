@@ -26,6 +26,9 @@ jobs:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TMDB_TOKEN: ${{ secrets.TMDB_TOKEN }}
       ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+      FANART_KEY: ${{ secrets.FANART_KEY }}
+      GOOGLE_KEY: ${{ secrets.GOOGLE_KEY }}
+      GOOGLE_CX: ${{ secrets.GOOGLE_CX }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
