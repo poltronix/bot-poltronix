@@ -104,7 +104,7 @@ def detalhes(mid):
         "titulo": f["title"],
         "ano": (f.get("release_date") or "")[:4],
         "sinopse": f.get("overview") or "Sinopse indisponível.",
-        "capa": f"https://image.tmdb.org/t/p/w780{f['poster_path']}" if f.get("poster_path") else None,
+        "capa": f.get("poster_path"),  # baixada em resolução original na hora de enviar
     }
 
 def legenda(f):
@@ -112,11 +112,27 @@ def legenda(f):
     sinopse = f["sinopse"] if len(f["sinopse"]) < 900 else f["sinopse"][:897] + "..."
     return f"<b>{f['titulo']} ({f['ano']})</b>\n\n{sinopse}"
 
+def baixar_capa(poster_path):
+    """Baixa a capa na resolução ORIGINAL do TMDB (alta qualidade).
+    Se passar do limite de 10 MB do Telegram, usa a maior versão reduzida (w780)."""
+    for tam in ("original", "w780"):
+        r = requests.get(f"https://image.tmdb.org/t/p/{tam}{poster_path}", timeout=60)
+        r.raise_for_status()
+        if len(r.content) < 9_500_000:
+            return r.content
+    return r.content
+
 def enviar(chat, f, botoes):
     kb = {"inline_keyboard": botoes}
     if f["capa"]:
-        return tg("sendPhoto", chat_id=chat, photo=f["capa"], caption=legenda(f),
-                  parse_mode="HTML", reply_markup=kb)
+        foto = baixar_capa(f["capa"])
+        r = requests.post(f"{TG}/sendPhoto", timeout=120,
+                          data={"chat_id": chat, "caption": legenda(f), "parse_mode": "HTML",
+                                "reply_markup": json.dumps(kb)},
+                          files={"photo": ("capa.jpg", foto, "image/jpeg")}).json()
+        if not r.get("ok"):
+            raise RuntimeError(f"Telegram sendPhoto: {r.get('description', r)}")
+        return r["result"]
     return tg("sendMessage", chat_id=chat, text=legenda(f), parse_mode="HTML", reply_markup=kb)
 
 BOTAO_CANAL = [[{"text": BOTAO_TEXTO, "url": BOTAO_LINK}]]
@@ -130,7 +146,7 @@ def previa(f, teste=False):
     """Manda para o canal de rascunhos; sem canal de rascunhos, publica direto."""
     rid = rascunho_id()
     if teste:
-        print(f"---- {'RASCUNHO' if rid else 'CANAL'} ----\n{legenda(f)}\n[capa] {f['capa']}")
+        print(f"---- {'RASCUNHO' if rid else 'CANAL'} ----\n{legenda(f)}\n[capa] https://image.tmdb.org/t/p/original{f['capa']}")
         return
     if not rid:
         return publicar(f)
