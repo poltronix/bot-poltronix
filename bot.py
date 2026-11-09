@@ -30,8 +30,9 @@ Variáveis de ambiente (arquivo .env ou Secrets do GitHub):
   CANAL_ID         padrão: @poltronix
   RASCUNHO_ID      opcional; se vazio, usa o canal registrado com /rascunho (rascunho.txt)
 """
-import argparse, json, os, re, sys, pathlib
+import argparse, io, json, os, re, sys, pathlib, unicodedata
 import requests
+from PIL import Image
 
 def load_env(path=".env"):
     p = pathlib.Path(path)
@@ -105,54 +106,120 @@ def detalhes(mid):
         "titulo": f["title"],
         "ano": (f.get("release_date") or "")[:4],
         "sinopse": f.get("overview") or "Sinopse indisponível.",
-        "capa": melhor_capa(mid) or f.get("poster_path"),
+        "original": f.get("original_title"),
+        "poster_padrao": f.get("poster_path"),
     }
 
-def melhor_capa(mid):
-    """Escolhe, entre TODAS as capas do filme no TMDB, a mais nítida.
-    Prioridade: capa em português em alta resolução > em inglês > sem texto,
-    sempre preferindo a maior resolução (mínimo 1400px de largura)."""
+# ---------------- capas em alta qualidade ----------------
+# Fontes, em ordem de preferência (todas sem marca d'água):
+#  1. Apple TV / iTunes Brasil  -> arte oficial em português, em altíssima resolução
+#  2. TMDB, capa em português   -> a de maior resolução / mais votada
+#  3. Apple TV / iTunes EUA     -> arte oficial em inglês
+#  4. TMDB, capa em inglês ou sem texto
+# A primeira com pelo menos MIN_LARGURA px de largura vence; se nenhuma, a maior.
+MIN_LARGURA = 1400
+
+def _norm(t):
+    return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", t or "").encode("ascii", "ignore").decode().lower())
+
+def capa_itunes(titulos, ano, pais):
+    for titulo in titulos:
+        try:
+            r = requests.get("https://itunes.apple.com/search", timeout=20, params={
+                "term": titulo, "media": "movie", "entity": "movie", "country": pais, "limit": 10}).json()
+        except Exception as e:
+            print(f"(aviso) iTunes {pais}: {e}")
+            return None
+        for it in r.get("results", []):
+            a = (it.get("releaseDate") or "")[:4]
+            if _norm(it.get("trackName")) == _norm(titulo) and (not ano or not a or abs(int(a) - int(ano)) <= 1):
+                art = it.get("artworkUrl100", "")
+                if art:
+                    return re.sub(r"/\d+x\d+bb\.(jpg|png)$", "/2000x3000bb.jpg", art)
+    return None
+
+def capas_tmdb(mid):
     try:
         imgs = tmdb(f"/movie/{mid}/images", language=None,
                     include_image_language="pt,en,null").get("posters", [])
     except Exception as e:
-        print(f"(aviso) imagens: {e}")
-        return None
-    if not imgs:
-        return None
+        print(f"(aviso) imagens TMDB: {e}")
+        return {}
     def nota(i):
         return (i.get("vote_average", 0) or 0) * min(i.get("vote_count", 0) or 0, 10)
+    melhor = {}
     for lang in ("pt", "en", None):
-        hd = [i for i in imgs if i.get("iso_639_1") == lang and i.get("width", 0) >= 1400]
-        if hd:
-            esc = max(hd, key=lambda i: (nota(i), i["width"]))
+        cands = [i for i in imgs if i.get("iso_639_1") == lang]
+        if cands:
+            hd = [i for i in cands if i.get("width", 0) >= MIN_LARGURA] or cands
+            esc = max(hd, key=lambda i: (nota(i), i.get("width", 0)))
+            melhor[lang] = f"https://image.tmdb.org/t/p/original{esc['file_path']}"
+    return melhor
+
+def tamanho(conteudo):
+    try:
+        return Image.open(io.BytesIO(conteudo)).size
+    except Exception:
+        return (0, 0)
+
+def melhor_capa(f):
+    """Testa as fontes em ordem e devolve (bytes_jpeg, descricao) da capa mais nítida."""
+    titulos = [t for t in dict.fromkeys([f["titulo"], f.get("original")]) if t]
+    tm = capas_tmdb(f["id"])
+    fontes = [
+        ("Apple TV BR", lambda: capa_itunes(titulos, f["ano"], "br")),
+        ("TMDB pt", lambda: tm.get("pt")),
+        ("Apple TV EUA", lambda: capa_itunes(titulos[::-1], f["ano"], "us")),
+        ("TMDB en", lambda: tm.get("en")),
+        ("TMDB sem texto", lambda: tm.get(None)),
+        ("TMDB padrão", lambda: f["poster_padrao"] and f"https://image.tmdb.org/t/p/original{f['poster_padrao']}"),
+    ]
+    achadas = []
+    for nome, pegar in fontes:
+        url = pegar()
+        if not url:
+            continue
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+        except Exception as e:
+            print(f"(aviso) {nome}: {e}")
+            continue
+        w, h = tamanho(r.content)
+        print(f"  {nome}: {w}x{h} {url}")
+        if w == 0:
+            continue
+        achadas.append((w, nome, r.content))
+        if w >= MIN_LARGURA:
             break
-    else:
-        esc = max(imgs, key=lambda i: i.get("width", 0))
-    print(f"Capa escolhida entre {len(imgs)}: {esc['width']}x{esc['height']} "
-          f"({esc.get('iso_639_1')}) https://image.tmdb.org/t/p/original{esc['file_path']}")
-    return esc["file_path"]
+    if not achadas:
+        return None, None
+    w, nome, conteudo = next((a for a in achadas if a[0] >= MIN_LARGURA), max(achadas, key=lambda a: a[0]))
+    return preparar(conteudo), f"{nome} {w}px"
+
+def preparar(conteudo):
+    """Ajusta para o máximo que o Telegram exibe (2560px) em JPEG de alta qualidade."""
+    img = Image.open(io.BytesIO(conteudo)).convert("RGB")
+    img.thumbnail((2560, 2560), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=95, optimize=True)
+    return out.getvalue()
 
 def legenda(f):
     # Formato igual aos posts do canal: título (ano) em negrito + sinopse
     sinopse = f["sinopse"] if len(f["sinopse"]) < 900 else f["sinopse"][:897] + "..."
     return f"<b>{f['titulo']} ({f['ano']})</b>\n\n{sinopse}"
 
-def baixar_capa(poster_path):
-    """Baixa a capa na resolução ORIGINAL do TMDB (alta qualidade).
-    Se passar do limite de 10 MB do Telegram, usa a maior versão reduzida (w780)."""
-    for tam in ("original", "w780"):
-        r = requests.get(f"https://image.tmdb.org/t/p/{tam}{poster_path}", timeout=60)
-        r.raise_for_status()
-        if len(r.content) < 9_500_000:
-            print(f"Capa baixada ({tam}): {len(r.content)//1024} KB")
-            return r.content
-    return r.content
-
 def enviar(chat, f, botoes):
     kb = {"inline_keyboard": botoes}
-    if f["capa"]:
-        foto = baixar_capa(f["capa"])
+    if f.get("file_id"):  # mesma imagem da prévia aprovada, sem recompressão extra
+        return tg("sendPhoto", chat_id=chat, photo=f["file_id"], caption=legenda(f),
+                  parse_mode="HTML", reply_markup=kb)
+    if "foto" not in f:
+        f["foto"], f["fonte_capa"] = melhor_capa(f)
+        print(f"Capa escolhida: {f['fonte_capa']}")
+    if f["foto"]:
+        foto = f["foto"]
         r = requests.post(f"{TG}/sendPhoto", timeout=120,
                           data={"chat_id": chat, "caption": legenda(f), "parse_mode": "HTML",
                                 "reply_markup": json.dumps(kb)},
@@ -173,7 +240,9 @@ def previa(f, teste=False):
     """Manda para o canal de rascunhos; sem canal de rascunhos, publica direto."""
     rid = rascunho_id()
     if teste:
-        print(f"---- {'RASCUNHO' if rid else 'CANAL'} ----\n{legenda(f)}\n[capa] https://image.tmdb.org/t/p/original{f['capa']}")
+        print(f"---- {'RASCUNHO' if rid else 'CANAL'} ----\n{legenda(f)}")
+        foto, fonte = melhor_capa(f)
+        print(f"[capa] {fonte}")
         return
     if not rid:
         return publicar(f)
@@ -276,6 +345,8 @@ def clique(cq, teste):
     if acao == "ok":
         if teste:
             print(f"[teste] publicaria {f['titulo']}"); return
+        if msg.get("photo"):
+            f["file_id"] = msg["photo"][-1]["file_id"]
         publicar(f)
         status = f"✅ PUBLICADO no {CANAL}"
     else:
